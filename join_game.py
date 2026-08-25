@@ -8,18 +8,29 @@ node-minecraft-protocol против настоящего сервера).
 import json
 import os
 
-# Получаем путь к папке, где лежит сам файл join_game.py
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Склеиваем с именем вашего файла (замените "data.json" на ваше имя файла)
-_DATA_PATH = os.path.join(_BASE_DIR, "data.json")
+# Проверяем оба возможных места для файла
+possible_paths = [
+    os.path.join(os.path.dirname(__file__), "login_packet_1_20_1.json.json"),
+    os.path.join(os.path.dirname(__file__), "data", "login_packet_1_20_1.json"),
+]
 
-from nbt_writer import encode_nbt
-from protocol import write_string, write_varint, write_long
+_DATA_PATH = None
+for path in possible_paths:
+    if os.path.exists(path):
+        _DATA_PATH = path
+        break
 
-_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "login_packet_1_20_1.json")
+if _DATA_PATH is None:
+    raise FileNotFoundError(
+        "Не найден login_packet_1_20_1.json ни в папке с join_game.py, "
+        "ни в папке data/ рядом с join_game.py"
+    )
 
 with open(_DATA_PATH, "r", encoding="utf-8") as _f:
     _LOGIN_DATA = json.load(_f)
+
+from nbt_writer import encode_nbt
+from protocol import write_string, write_varint, write_long
 
 _DIMENSION_CODEC_BYTES = encode_nbt(_LOGIN_DATA["dimensionCodec"], root_name="")
 
@@ -28,7 +39,7 @@ def build_join_game_payload(entity_id: int, max_players: int, view_distance: int
     out = bytearray()
     out += entity_id.to_bytes(4, byteorder="big", signed=True)   # Entity ID (Int)
     out += bytes([1 if _LOGIN_DATA["isHardcore"] else 0])        # Is Hardcore (bool)
-    out += bytes([1])                                              # Gamemode: 1 = Creative (0=Survival, 2=Adventure!)
+    out += bytes([1])                                             # Gamemode: 1 = Creative (0=Survival, 2=Adventure!)
     out += (-1).to_bytes(1, byteorder="big", signed=True)         # Previous Gamemode: -1 = нет
 
     world_names = _LOGIN_DATA["worldNames"]
