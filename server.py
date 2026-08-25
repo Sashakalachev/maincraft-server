@@ -1,140 +1,60 @@
 """
-Minimal Minecraft-сервер на чистом Python.
-
-Этап 1: сервер отвечает на пинг (виден в списке серверов, показывает MOTD,
-онлайн игроков, версию) и умеет принять Handshake.
-
-Дальше будем добавлять: Login -> Play (спавн игрока, чанки, движение).
+Собирает пакет Join Game (clientbound Login play) для протокола 763 (1.20.1),
+используя настоящие данные Mojang (registry codec и т.д.), взятые из
+data/login_packet_1_20_1.json - это точная копия того, что реально шлёт
+vanilla-сервер 1.20.1 (извлечено проектом minecraft-data через тесты
+node-minecraft-protocol против настоящего сервера).
 """
-import socket
-import threading
-import traceback
+import json
+import os
 
-from protocol import (
-    PacketBuffer,
-    read_packet,
-    send_packet,
-    write_string,
-    write_json,
-    write_varint,
-    write_long,
-)
-from play import handle_play
+# Получаем путь к папке, где лежит сам файл join_game.py
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Склеиваем с именем вашего файла (замените "data.json" на ваше имя файла)
+_DATA_PATH = os.path.join(_BASE_DIR, "data.json")
 
-HOST = "0.0.0.0"
-PORT = 25565
+from nbt_writer import encode_nbt
+from protocol import write_string, write_varint, write_long
 
-# Версия протокола, под которую пишем сервер.
-# 763 = Minecraft 1.20.1. Если у вас другая версия клиента - скажи, поменяем.
-PROTOCOL_VERSION = 763
-GAME_VERSION_NAME = "1.20.1"
+_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "login_packet_1_20_1.json")
 
-MOTD = "§aPython Server §7| §fНаписан с нуля"
-MAX_PLAYERS = 20
+with open(_DATA_PATH, "r", encoding="utf-8") as _f:
+    _LOGIN_DATA = json.load(_f)
+
+_DIMENSION_CODEC_BYTES = encode_nbt(_LOGIN_DATA["dimensionCodec"], root_name="")
 
 
-def handle_status(sock: socket.socket):
-    """Обрабатывает состояние Status: отдаёт JSON с описанием сервера + отвечает на Ping."""
-    while True:
-        pkt = read_packet(sock)
-        packet_id = pkt.read_varint()
+def build_join_game_payload(entity_id: int, max_players: int, view_distance: int = 10) -> bytes:
+    out = bytearray()
+    out += entity_id.to_bytes(4, byteorder="big", signed=True)   # Entity ID (Int)
+    out += bytes([1 if _LOGIN_DATA["isHardcore"] else 0])        # Is Hardcore (bool)
+    out += bytes([1])                                              # Gamemode: 1 = Creative (0=Survival, 2=Adventure!)
+    out += (-1).to_bytes(1, byteorder="big", signed=True)         # Previous Gamemode: -1 = нет
 
-        if packet_id == 0x00:
-            # Status Request -> отвечаем Status Response
-            response = {
-                "version": {"name": GAME_VERSION_NAME, "protocol": PROTOCOL_VERSION},
-                "players": {
-                    "max": MAX_PLAYERS,
-                    "online": 0,
-                    "sample": [],
-                },
-                "description": {"text": MOTD},
-            }
-            send_packet(sock, 0x00, write_json(response))
+    world_names = _LOGIN_DATA["worldNames"]
+    out += write_varint(len(world_names))
+    for name in world_names:
+        out += write_string(name)
 
-        elif packet_id == 0x01:
-            # Ping request -> Pong response (просто эхо long-числа)
-            payload = pkt.read(8)
-            send_packet(sock, 0x01, payload)
-            return  # после понга клиент сам закрывает соединение
+    out += _DIMENSION_CODEC_BYTES                       # Dimension Codec (NBT)
+    out += write_string(_LOGIN_DATA["worldType"])        # Dimension Type (identifier string, 1.20.1-специфично)
+    out += write_string(_LOGIN_DATA["worldName"])        # World Name (identifier)
 
+    hashed_seed = _LOGIN_DATA["hashedSeed"]
+    high, low = hashed_seed
+    combined = ((high & 0xFFFFFFFF) << 32) | (low & 0xFFFFFFFF)
+    if combined & (1 << 63):
+        combined -= 1 << 64
+    out += write_long(combined)                          # Hashed seed (Long)
 
-def handle_login(sock: socket.socket, addr):
-    """Обрабатывает состояние Login: читает ник, отправляет Login Success
-    (offline-mode - без проверки через Mojang), затем передаёт управление
-    в Play-состояние."""
-    pkt = read_packet(sock)
-    packet_id = pkt.read_varint()
+    out += write_varint(max_players)                     # Max Players (VarInt)
+    out += write_varint(view_distance)                    # View Distance (VarInt)
+    out += write_varint(_LOGIN_DATA["simulationDistance"])  # Simulation Distance (VarInt)
+    out += bytes([1 if _LOGIN_DATA["reducedDebugInfo"] else 0])
+    out += bytes([1 if _LOGIN_DATA["enableRespawnScreen"] else 0])
+    out += bytes([1 if _LOGIN_DATA["isDebug"] else 0])
+    out += bytes([1 if _LOGIN_DATA["isFlat"] else 0])
+    out += bytes([0])                                     # Has Death Location? (bool) - у нас нет
+    out += write_varint(_LOGIN_DATA["portalCooldown"])     # Portal Cooldown (VarInt)
 
-    if packet_id != 0x00:
-        return
-
-    username = pkt.read_string()
-    print(f"[LOGIN] {addr} входит как '{username}'")
-
-    # Login Success (0x02): UUID (16 байт) + Username + Properties count (0)
-    import hashlib
-    # offline-mode UUID - детерминированный хэш от "OfflinePlayer:<ник>",
-    # так же как это делает vanilla-сервер в offline-mode.
-    digest = hashlib.md5(f"OfflinePlayer:{username}".encode("utf-8")).digest()
-    uuid_bytes = bytearray(digest)
-    uuid_bytes[6] = (uuid_bytes[6] & 0x0F) | 0x30  # версия 3
-    uuid_bytes[8] = (uuid_bytes[8] & 0x3F) | 0x80  # вариант
-
-    payload = bytes(uuid_bytes) + write_string(username) + write_varint(0)
-    send_packet(sock, 0x02, payload)
-
-    handle_play(sock, addr, username, bytes(uuid_bytes))
-
-
-def handle_client(conn: socket.socket, addr):
-    try:
-        # --- Handshake ---
-        pkt = read_packet(conn)
-        packet_id = pkt.read_varint()
-        if packet_id != 0x00:
-            conn.close()
-            return
-
-        protocol_version = pkt.read_varint()
-        server_address = pkt.read_string()
-        server_port = pkt.read_unsigned_short()
-        next_state = pkt.read_varint()
-
-        print(f"[HANDSHAKE] {addr} -> protocol={protocol_version}, "
-              f"addr={server_address}:{server_port}, next_state={next_state}")
-
-        if next_state == 1:
-            handle_status(conn)
-        elif next_state == 2:
-            handle_login(conn, addr)
-
-    except (ConnectionError, EOFError):
-        pass
-    except Exception:
-        print(f"[ERROR] Ошибка при обработке {addr}:")
-        traceback.print_exc()
-    finally:
-        conn.close()
-
-
-def main():
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((HOST, PORT))
-    server_sock.listen(128)
-    print(f"Сервер слушает на {HOST}:{PORT} (протокол {PROTOCOL_VERSION} / MC {GAME_VERSION_NAME})")
-
-    try:
-        while True:
-            conn, addr = server_sock.accept()
-            thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
-            thread.start()
-    except KeyboardInterrupt:
-        print("\nОстанавливаю сервер...")
-    finally:
-        server_sock.close()
-
-
-if __name__ == "__main__":
-    main()
+    return bytes(out)
