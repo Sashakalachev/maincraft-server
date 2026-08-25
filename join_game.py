@@ -8,6 +8,11 @@ node-minecraft-protocol против настоящего сервера).
 import json
 import os
 
+# Получаем путь к папке, где лежит сам файл join_game.py
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Склеиваем с именем вашего файла (замените "data.json" на ваше имя файла)
+_DATA_PATH = os.path.join(_BASE_DIR, "data.json")
+
 from nbt_writer import encode_nbt
 from protocol import write_string, write_varint, write_long
 
